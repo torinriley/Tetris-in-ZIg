@@ -1,0 +1,221 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+env:
+  RAYLIB_VERSION: "5.5"
+  ZIG_VERSION: "0.14.0"
+
+jobs:
+  build:
+    name: Build (${{ matrix.artifact_name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: tetris-linux-x86_64
+            binary: tetris
+            archive: tetris-linux-x86_64.tar.gz
+
+          - os: windows-latest
+            artifact_name: tetris-windows-x86_64
+            binary: tetris.exe
+            archive: tetris-windows-x86_64.zip
+
+          - os: macos-13
+            artifact_name: tetris-macos-x86_64
+            binary: tetris
+            archive: tetris-macos-x86_64.tar.gz
+
+          - os: macos-latest
+            artifact_name: tetris-macos-aarch64
+            binary: tetris
+            archive: tetris-macos-aarch64.tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # ── Linux: build Raylib from source and install to /usr/local ──
+      - name: Install Raylib (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake build-essential \
+            libgl1-mesa-dev libx11-dev libxi-dev \
+            libxcursor-dev libxrandr-dev libxinerama-dev
+          git clone --depth 1 --branch ${{ env.RAYLIB_VERSION }} \
+            https://github.com/raysan5/raylib.git /tmp/raylib
+          cmake -S /tmp/raylib -B /tmp/raylib/build \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+          sudo cmake --build /tmp/raylib/build \
+            --target install -j$(nproc)
+
+      # ── Windows: download pre-built MinGW package → C:\raylib ──
+      - name: Install Raylib (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/raysan5/raylib/releases/download/$env:RAYLIB_VERSION/raylib-$env:RAYLIB_VERSION`_win64_mingw-w64.zip"
+          Invoke-WebRequest -Uri $url -OutFile raylib.zip
+          Expand-Archive -Path raylib.zip -DestinationPath C:\raylib_src
+          $inner = Get-ChildItem C:\raylib_src | Select-Object -First 1
+          New-Item -ItemType Directory -Path C:\raylib -Force | Out-Null
+          Copy-Item "$($inner.FullName)\include" C:\raylib\include -Recurse -Force
+          Copy-Item "$($inner.FullName)\lib"     C:\raylib\lib     -Recurse -Force
+          Write-Host "Raylib installed to C:\raylib"
+          Get-ChildItem C:\raylib -Recurse | Select-Object FullName
+
+      # ── macOS: install via Homebrew ──
+      - name: Install Raylib (macOS)
+        if: runner.os == 'macOS'
+        run: brew install raylib
+
+      # ── Build ──
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast
+
+      # ── Package ──
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path bundle -Force | Out-Null
+          Copy-Item zig-out\bin\tetris.exe bundle\
+          Copy-Item raylib.dll            bundle\
+          Compress-Archive -Path bundle\* -DestinationPath ${{ matrix.archive }}
+
+      - name: Package (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir bundle
+          cp zig-out/bin/tetris bundle/
+          tar -czf ${{ matrix.archive }} -C bundle tetris
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
+      - name: Generate release tag
+        id: tag
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          DATE=$(date -u +'%Y-%m-%d')
+          echo "tag=nightly-${DATE}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Get all commits since the last release tag (or last 10 if no tag)
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -n "$LAST_TAG" ]; then
+            LOG=$(git log "${LAST_TAG}..HEAD" --pretty=format:"- %s (%h)" --no-merges)
+          else
+            LOG=$(git log --pretty=format:"- %s (%h)" --no-merges -10)
+          fi
+          # Escape for GitHub output
+          {
+            echo "log<<EOF"
+            echo "$LOG"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "Nightly Build — ${{ steps.tag.outputs.date }}"
+          prerelease: true
+          draft: false
+          generate_release_notes: false
+          body: |
+            ## Tetris in Zig — Nightly Build
+
+            > Built from commit [`${{ github.sha }}`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}) on `${{ steps.tag.outputs.date }}`
+
+            ---
+
+            ### What's included in this build
+
+            ${{ steps.changelog.outputs.log }}
+
+            ---
+
+            ### Downloads
+
+            | Platform | Architecture | File |
+            |----------|-------------|------|
+            | Windows | x86-64 | `tetris-windows-x86_64.zip` |
+            | Linux | x86-64 | `tetris-linux-x86_64.tar.gz` |
+            | macOS | Intel (x86-64) | `tetris-macos-x86_64.tar.gz` |
+            | macOS | Apple Silicon (ARM64) | `tetris-macos-aarch64.tar.gz` |
+
+            ---
+
+            ### How to run
+
+            **Windows**
+            1. Download and extract `tetris-windows-x86_64.zip`
+            2. Keep `raylib.dll` in the same folder as `tetris.exe`
+            3. Double-click `tetris.exe` or run it from a terminal
+
+            **Linux**
+            ```bash
+            tar -xzf tetris-linux-x86_64.tar.gz
+            chmod +x tetris
+            ./tetris
+            ```
+
+            **macOS**
+            ```bash
+            tar -xzf tetris-macos-*.tar.gz
+            chmod +x tetris
+            ./tetris
+            # If blocked by Gatekeeper: System Settings → Privacy → Open Anyway
+            ```
+
+            ---
+
+            > This is an automated nightly build and may be unstable.
+            > Compiled with **Zig ${{ env.ZIG_VERSION }}** · **Raylib ${{ env.RAYLIB_VERSION }}**
+          files: |
+            artifacts/*.zip
+            artifacts/*.tar.gz
