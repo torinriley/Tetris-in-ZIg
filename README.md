@@ -6,6 +6,8 @@ Minimal but fully playable Tetris written in Zig with Raylib.
 
 - Zig (0.15.x recommended)
 - Raylib installed on your system (`raylib` available to the linker)
+- Ensure that raylib is installed at `C:/raylib` if on windows
+
 
 ## Run
 

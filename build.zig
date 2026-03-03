@@ -14,14 +14,23 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.linkLibC();
-    exe.linkSystemLibrary("raylib");
 
-    if (target.result.os.tag == .linux) {
+    if (target.result.os.tag == .windows) {
+        exe.addIncludePath(.{ .cwd_relative = "C:/raylib/include" });
+        exe.addLibraryPath(.{ .cwd_relative = "C:/raylib/lib" });
+        exe.linkSystemLibrary("raylib");
+        exe.linkSystemLibrary("winmm");
+        exe.linkSystemLibrary("gdi32");
+        exe.linkSystemLibrary("opengl32");
+    } else if (target.result.os.tag == .linux) {
+        exe.linkSystemLibrary("raylib");
         exe.linkSystemLibrary("m");
         exe.linkSystemLibrary("dl");
         exe.linkSystemLibrary("pthread");
         exe.linkSystemLibrary("rt");
         exe.linkSystemLibrary("X11");
+    } else {
+        exe.linkSystemLibrary("raylib");
     }
 
     b.installArtifact(exe);
